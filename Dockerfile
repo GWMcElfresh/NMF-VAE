@@ -14,15 +14,19 @@
 #   SKIP_BASE_DEPS  — set to "true" when BASE_IMAGE already contains the pip
 #                     deps layer (avoids re-installing on cache hits)
 #   DEPS_IMAGE      — fully-built deps image to layer the runtime stage on top
-#                     of (defaults to the deps stage in this file for local builds)
+#                     of (defaults to "deps", the local stage, for plain builds)
+#
+# NOTE: Any ARG used in a FROM instruction must be declared before the first FROM.
 # =============================================================================
 
-# --- Stage 1: deps -----------------------------------------------------------
+# Declare both ARGs that appear in FROM instructions before any FROM statement.
 ARG BASE_IMAGE=nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+ARG DEPS_IMAGE=deps
+
+# --- Stage 1: deps -----------------------------------------------------------
 FROM ${BASE_IMAGE} AS deps
 
 ARG SKIP_BASE_DEPS=false
-ARG PYTHON_VERSION=3.10
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -58,8 +62,8 @@ RUN if [ "$SKIP_BASE_DEPS" != "true" ]; then \
 # --- Stage 2: runtime --------------------------------------------------------
 # When called by docker-cache.yml the DEPS_IMAGE build-arg is set to the
 # fully-built (and potentially remote) deps image, bypassing the deps stage
-# above.  Local/direct builds fall back to the deps stage in this file.
-ARG DEPS_IMAGE=deps
+# above.  For plain local builds (no --build-arg DEPS_IMAGE=...) Docker
+# resolves "deps" to the local stage built above.
 FROM ${DEPS_IMAGE} AS runtime
 
 WORKDIR /app
