@@ -1,0 +1,10 @@
+Bootstrap: docker
+From: python:3.10-slim
+
+%post
+    apt-get update && apt-get install -y gcc g++
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install anndata scanpy scipy pandas matplotlib seaborn umap-learn pytest
+
+%runscript
+    exec python "$@"

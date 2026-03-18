@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: nmfvae
+Version: 0.1.0
+Summary: NMF-like Variational Autoencoder for single-cell RNA-seq data
+Author: NMF-VAE Authors
+Requires-Python: >=3.8
+License-File: LICENSE
