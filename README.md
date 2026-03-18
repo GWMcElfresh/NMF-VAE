@@ -50,7 +50,13 @@ pip install -e .
 ### Docker
 
 ```bash
+# Build locally (GPU-capable image using CUDA 12.1)
 docker build -t nmfvae .
+
+# Run with GPU (requires nvidia-container-toolkit)
+docker run --rm --gpus all nmfvae python scripts/train.py --help
+
+# Run on CPU only (falls back automatically)
 docker run --rm nmfvae
 ```
 
@@ -165,8 +171,14 @@ All 9 unit tests cover:
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR:
 
-1. **test** job – installs CPU PyTorch, runs pytest
-2. **docker** job – builds Docker image, verifies size < 14 GB, pushes to GHCR on `main`
+1. **test** job – installs CPU PyTorch, runs pytest (fast, no Docker)
+2. **docker** job – delegates to `GWMcElfresh/dockerDependencies/docker-cache.yml`:
+   - Pulls the current month's base-deps image from GHCR (built once/month by `monthly-base.yml`)
+   - Hashes `requirements.txt` → pulls or builds the incremental deps image
+   - Builds the GPU-capable runtime image and runs tests inside it
+   - Pushes the runtime to GHCR on `main`/`master` merges
+
+`.github/workflows/monthly-base.yml` rebuilds the base dependency image on the 1st of each month (or on manual trigger) via `GWMcElfresh/dockerDependencies/build-base-image.yml`.
 
 ## References
 
