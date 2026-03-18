@@ -1,0 +1,31 @@
+name: Build Monthly Base Image
+
+# Runs on the 1st of every month to build the heavy "deps" stage from scratch
+# and publish it to GHCR as the base for all subsequent fast incremental builds.
+#
+# The base image is tagged ghcr.io/<owner>/nmf-vae/base-deps:YYYY-MM and :latest.
+# The fast-incremental docker-cache.yml workflow (called from ci.yml) pulls this
+# image and layers only new/changed dependencies on top of it.
+
+on:
+  schedule:
+    # 1st of every month at 02:00 UTC
+    - cron: '0 2 1 * *'
+  workflow_dispatch:
+    inputs:
+      force-rebuild:
+        description: 'Force rebuild even if the base image for this month already exists'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-base:
+    uses: GWMcElfresh/dockerDependencies/.github/workflows/build-base-image.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      # Pass force-rebuild when triggered manually; default to false for scheduled runs
+      force-rebuild: ${{ inputs.force-rebuild == true }}
+    secrets: inherit

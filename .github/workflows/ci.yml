@@ -1,0 +1,66 @@
+name: CI
+
+# Runs on every push to main/master and on all pull requests.
+# ┌─ test  ─────────── pure-Python tests with CPU torch (fast, no Docker)
+# └─ docker ────────── staged Docker build via GWMcElfresh/dockerDependencies
+#                      (deps cache + GPU-capable runtime image → GHCR on main)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python unit tests — CPU-only torch for speed, no Docker required
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install CPU torch (CI-only, fast)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ---------------------------------------------------------------------------
+  # Docker build — GPU-capable image, two-tier dependency caching via
+  #                GWMcElfresh/dockerDependencies/docker-cache.yml
+  #
+  # Strategy
+  #   1. Pull the current month's base-deps image from GHCR (built by
+  #      monthly-base.yml; very fast because the heavy pip install is done).
+  #   2. Hash requirements.txt → pull or build the incremental deps image.
+  #   3. Build the runtime stage (app code on top of deps).
+  #   4. Push runtime to GHCR only when merging to main/master.
+  # ---------------------------------------------------------------------------
+  docker:
+    needs: test
+    uses: GWMcElfresh/dockerDependencies/.github/workflows/docker-cache.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      python-version: '3.10'
+      use-base-image: true
+      runtime-image-name: nmfvae:test
+      # Run the full test suite inside the GPU-capable container image
+      test-command: python -m pytest tests/ -v
+      push-images: true
+      # The reusable workflow gates the actual push on github.ref == main/master
+      push-runtime: true
+    secrets: inherit

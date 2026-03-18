@@ -1,0 +1,21 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev gcc g++ \
+    && ln -sf python3 /usr/bin/python \
+    && ln -sf pip3 /usr/bin/pip \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Install GPU-capable PyTorch (CUDA 12.1) and project dependencies
+    pip install --no-cache-dir \
+        torch torchvision \
+        --index-url https://download.pytorch.org/whl/cu121
+    pip install --no-cache-dir \
+        anndata scanpy scipy pandas \
+        matplotlib seaborn umap-learn pytest
+
+%runscript
+    exec python "$@"
