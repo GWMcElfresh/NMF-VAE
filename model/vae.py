@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from .decoder import NNDecoder
 from .distributions import WeibullDistribution, kl_weibull_gamma, nb_log_likelihood
 from .encoder import WeibullEncoder
+from utils.graph_utils import resolve_lambda
 
 
 class NMFVAE(nn.Module):
@@ -28,6 +29,17 @@ class NMFVAE(nn.Module):
     Uses a Weibull approximate posterior and a Gamma prior to encourage
     non-negative, NMF-interpretable latent factors.
 
+    An optional graph Laplacian penalty on the decoder weight matrix can be
+    enabled to encourage biologically coherent gene programs that are
+    consistent with a known gene interaction network (e.g. STRING).
+
+    The total loss is:
+
+    .. math::
+
+        \\mathcal{L} = \\mathcal{L}_{\\text{ELBO}} + \\lambda \\cdot
+        \\mathrm{Tr}(W^\\top L W)
+
     Args:
         input_dim: Number of input genes.
         latent_dim: Number of latent factors.
@@ -35,6 +47,14 @@ class NMFVAE(nn.Module):
         gamma_alpha: Shape of the Gamma prior.
         gamma_beta: Rate of the Gamma prior.
         use_nb: If True use Negative Binomial likelihood, else Poisson.
+        lambda_graph: Regularization strength for the graph Laplacian penalty.
+            Accepts a non-negative float **or** one of the named presets
+            ``"none"`` (0), ``"weak"`` (0.01), ``"moderate"`` (0.1), or
+            ``"strong"`` (1.0).  Defaults to ``0.0`` (disabled).
+        graph_laplacian: Precomputed graph Laplacian tensor of shape
+            ``(input_dim, input_dim)``.  Can be supplied at construction time
+            or later via :meth:`set_graph_laplacian`.  Required when
+            ``lambda_graph > 0``.
     """
 
     def __init__(
@@ -45,6 +65,8 @@ class NMFVAE(nn.Module):
         gamma_alpha: float = 1.0,
         gamma_beta: float = 1.0,
         use_nb: bool = True,
+        lambda_graph: Union[float, str] = 0.0,
+        graph_laplacian: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -57,8 +79,26 @@ class NMFVAE(nn.Module):
         self.gamma_beta = gamma_beta
         self.use_nb = use_nb
 
+        # Resolve named preset → float
+        self.lambda_graph: float = resolve_lambda(lambda_graph)
+
         self.encoder = WeibullEncoder(input_dim, latent_dim, hidden_dims)
         self.decoder = NNDecoder(latent_dim, input_dim)
+
+        # Register Laplacian as a buffer so it moves with .to(device).
+        # None is allowed when lambda_graph == 0.
+        if graph_laplacian is not None:
+            expected_shape = (input_dim, input_dim)
+            if tuple(graph_laplacian.shape) != expected_shape:
+                raise ValueError(
+                    f"graph_laplacian must have shape {expected_shape}, "
+                    f"got {tuple(graph_laplacian.shape)}"
+                )
+            self.register_buffer(
+                "_graph_laplacian", graph_laplacian.float()
+            )
+        else:
+            self.register_buffer("_graph_laplacian", None)
 
         # Track training loss history
         self.loss_history: List[float] = []
@@ -119,6 +159,45 @@ class NMFVAE(nn.Module):
         return mu, theta, k, lam
 
     # ------------------------------------------------------------------
+    # Graph Laplacian utilities
+    # ------------------------------------------------------------------
+
+    def set_graph_laplacian(self, L: torch.Tensor) -> None:
+        """
+        Set (or replace) the graph Laplacian buffer.
+
+        The tensor is moved to the same device as the model parameters.
+
+        Args:
+            L: Graph Laplacian of shape ``(input_dim, input_dim)``.
+        """
+        device = next(self.parameters()).device
+        self.register_buffer("_graph_laplacian", L.float().to(device))
+
+    @staticmethod
+    def laplacian_penalty(W: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the graph Laplacian penalty ``Tr(W^T L W)``.
+
+        This equals :math:`\\sum_{i,j} A_{ij} \\|w_i - w_j\\|^2 / 2` for
+        the unnormalized Laplacian, encouraging connected genes (large
+        :math:`A_{ij}`) to have similar decoder weight vectors.
+
+        Args:
+            W: Non-negative decoder weight matrix, shape ``(genes, latent)``.
+            L: Symmetric positive-semi-definite graph Laplacian, shape
+               ``(genes, genes)``.  May be a dense or sparse tensor.
+
+        Returns:
+            Scalar penalty value (≥ 0).
+        """
+        if L.is_sparse:
+            LW = torch.sparse.mm(L, W)
+        else:
+            LW = L @ W
+        return torch.trace(W.t() @ LW)
+
+    # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
@@ -128,14 +207,20 @@ class NMFVAE(nn.Module):
         kl_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute -ELBO = reconstruction_loss + kl_weight * kl_loss.
+        Compute the total training loss.
+
+        .. math::
+
+            \\mathcal{L} = -\\text{ELBO} + \\lambda \\cdot \\mathrm{Tr}(W^\\top L W)
+
+        where ``-ELBO = reconstruction_loss + kl_weight * kl_loss``.
 
         Args:
             x: Count matrix, shape (batch, genes).
             kl_weight: Annealing weight on the KL term.
 
         Returns:
-            loss: Scalar -ELBO.
+            loss: Scalar total loss (ELBO + Laplacian penalty).
             recon_loss: Scalar reconstruction loss.
             kl_loss: Scalar KL divergence.
         """
@@ -160,6 +245,12 @@ class NMFVAE(nn.Module):
         kl_loss = kl.sum(dim=1).mean()
 
         loss = recon_loss + kl_weight * kl_loss
+
+        # Graph Laplacian penalty
+        if self.lambda_graph > 0.0 and self._graph_laplacian is not None:
+            W = self.decoder.W  # (genes, latent), non-negative
+            lap_penalty = self.laplacian_penalty(W, self._graph_laplacian)
+            loss = loss + self.lambda_graph * lap_penalty
 
         return loss, recon_loss, kl_loss
 
@@ -304,7 +395,18 @@ def fit_model(
         count_matrix: np.ndarray of shape (cells, genes) OR anndata.AnnData.
         metadata: Optional cell metadata (unused in training, stored for export).
         config: Dict with keys: latent_dim, hidden_dims, epochs, batch_size,
-                lr, kl_weight, gamma_alpha, gamma_beta, use_nb.
+                lr, kl_weight, gamma_alpha, gamma_beta, use_nb,
+                lambda_graph, graph_laplacian.
+
+                ``lambda_graph`` accepts a non-negative float or one of the
+                named presets ``"none"``, ``"weak"``, ``"moderate"``,
+                ``"strong"`` (default ``0.0``).
+
+                ``graph_laplacian`` accepts a precomputed
+                :class:`torch.Tensor` of shape ``(genes, genes)`` to use as
+                the graph Laplacian.  Build one with
+                :func:`utils.graph_utils.build_string_laplacian` or
+                :func:`utils.graph_utils.build_coexpression_laplacian`.
 
     Returns:
         Trained NMFVAE model.
@@ -339,6 +441,8 @@ def fit_model(
     gamma_alpha = config.get("gamma_alpha", 1.0)
     gamma_beta = config.get("gamma_beta", 1.0)
     use_nb = config.get("use_nb", True)
+    lambda_graph = config.get("lambda_graph", 0.0)
+    graph_laplacian = config.get("graph_laplacian", None)
 
     # Inline dataloader creation to avoid cross-package import issues
     tensor = torch.tensor(count_matrix, dtype=torch.float32)
@@ -352,6 +456,8 @@ def fit_model(
         gamma_alpha=gamma_alpha,
         gamma_beta=gamma_beta,
         use_nb=use_nb,
+        lambda_graph=lambda_graph,
+        graph_laplacian=graph_laplacian,
     )
     model.fit(dataloader, epochs=epochs, lr=lr, kl_weight=kl_weight)
 
