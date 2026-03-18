@@ -109,7 +109,7 @@ class NMFVAE(nn.Module):
         """
         # Compute per-cell library size for scaling
         library_size = x.sum(dim=1, keepdim=True).clamp(min=1.0)
-        # Normalise to mean 1 so decoder weights are on a common scale
+        # Normalize to mean 1 so decoder weights are on a common scale
         library_size = library_size / library_size.mean()
 
         k, lam = self.encode(x)

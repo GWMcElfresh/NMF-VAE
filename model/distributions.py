@@ -10,6 +10,9 @@ import torch.nn as nn
 from torch.distributions import constraints
 import numpy as np
 
+# Euler-Mascheroni constant
+EULER_MASCHERONI = 0.5772156649
+
 
 class WeibullDistribution:
     """
@@ -77,9 +80,8 @@ class WeibullDistribution:
         H = γ * (1 - 1/k) + log(λ/k) + 1
         where γ is the Euler–Mascheroni constant.
         """
-        euler_mascheroni = 0.5772156649
         return (
-            euler_mascheroni * (1.0 - 1.0 / self.k)
+            EULER_MASCHERONI * (1.0 - 1.0 / self.k)
             + torch.log(self.lam / self.k)
             + 1.0
         )

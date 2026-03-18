@@ -25,7 +25,7 @@ def plot_latent_space(
     Args:
         Z: Latent matrix (cells × latent).
         metadata: Optional DataFrame with cell annotations.
-        color_by: Column in metadata to use for colouring.
+        color_by: Column in metadata to use for coloring.
         method: 'umap' or 'pca'.
         save_path: If given, save figure to this path.
     """
