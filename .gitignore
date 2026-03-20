@@ -20,6 +20,7 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/*.png
 
 # Data files (large)
 data/*.h5ad
