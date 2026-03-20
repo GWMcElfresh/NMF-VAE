@@ -244,3 +244,232 @@ def test_get_gene_programs(synthetic_counts):
 
     assert W.shape == (N_GENES, LATENT_DIM), f"W shape: {W.shape}"
     assert (W >= 0).all(), "W should be non-negative"
+
+
+# --------------------------------------------------------------------------
+# Graph utility tests
+# --------------------------------------------------------------------------
+
+
+def test_resolve_lambda_presets():
+    """Test that named presets resolve to the expected float values."""
+    from utils.graph_utils import resolve_lambda, LAMBDA_PRESETS
+
+    for name, expected in LAMBDA_PRESETS.items():
+        assert resolve_lambda(name) == expected, f"Preset '{name}' mismatch"
+
+    # Case insensitive
+    assert resolve_lambda("WEAK") == LAMBDA_PRESETS["weak"]
+    assert resolve_lambda("None") == 0.0
+
+
+def test_resolve_lambda_float():
+    """Test that a numeric lambda value passes through unchanged."""
+    from utils.graph_utils import resolve_lambda
+
+    assert resolve_lambda(0.5) == 0.5
+    assert resolve_lambda(0) == 0.0
+    assert resolve_lambda(1e-3) == pytest.approx(1e-3)
+
+
+def test_resolve_lambda_invalid():
+    """Test that invalid inputs raise ValueError."""
+    from utils.graph_utils import resolve_lambda
+
+    with pytest.raises(ValueError):
+        resolve_lambda("unknown_preset")
+
+    with pytest.raises(ValueError):
+        resolve_lambda(-0.1)
+
+
+def test_build_laplacian_unnormalized():
+    """Test unnormalized Laplacian L = D - A."""
+    from utils.graph_utils import build_laplacian_from_adjacency
+
+    # Simple two-node graph with weight 1
+    A = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    L = build_laplacian_from_adjacency(A, normalized=False)
+
+    expected = np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=np.float32)
+    np.testing.assert_allclose(L, expected, atol=1e-6)
+
+
+def test_build_laplacian_normalized():
+    """Test symmetric normalized Laplacian L = I - D^{-1/2} A D^{-1/2}."""
+    from utils.graph_utils import build_laplacian_from_adjacency
+
+    # 3-node path graph: 0 -- 1 -- 2
+    A = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32
+    )
+    L = build_laplacian_from_adjacency(A, normalized=True)
+
+    # L should be symmetric
+    np.testing.assert_allclose(L, L.T, atol=1e-6)
+
+    # Diagonal should be 1 for nodes with edges
+    assert L[0, 0] == pytest.approx(1.0, abs=1e-6)
+
+    # L should be positive semi-definite: all eigenvalues >= 0
+    eigvals = np.linalg.eigvalsh(L)
+    assert (eigvals >= -1e-6).all(), f"Non-PSD eigenvalues: {eigvals}"
+
+
+def test_build_laplacian_isolated_nodes():
+    """Isolated nodes (zero degree) are handled gracefully."""
+    from utils.graph_utils import build_laplacian_from_adjacency
+
+    # One connected pair + one isolated node
+    A = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32
+    )
+    L = build_laplacian_from_adjacency(A, normalized=True)
+    assert np.isfinite(L).all(), "Laplacian should be finite with isolated nodes"
+
+
+def test_laplacian_penalty_zero_for_constant_genes():
+    """Penalty should be zero when connected genes have identical weight rows."""
+    from model.vae import NMFVAE
+
+    # Two genes connected with weight 1 (unnormalized Laplacian)
+    L = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])
+
+    # Both genes have the same weight vector → penalty must be 0
+    W = torch.tensor([[2.0, 3.0], [2.0, 3.0]])  # rows identical
+    penalty = NMFVAE.laplacian_penalty(W, L)
+    assert penalty.item() == pytest.approx(0.0, abs=1e-5), (
+        f"Penalty should be 0 for constant gene weights, got {penalty.item()}"
+    )
+
+
+def test_laplacian_penalty_positive_for_divergent_genes():
+    """Penalty should increase when connected genes have different weight rows."""
+    from model.vae import NMFVAE
+
+    # Two genes connected with weight 1 (unnormalized Laplacian)
+    L = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])
+
+    # Identical weights → penalty = 0
+    W_const = torch.tensor([[1.0, 2.0], [1.0, 2.0]])
+    penalty_const = NMFVAE.laplacian_penalty(W_const, L)
+
+    # Divergent weights → penalty > 0
+    W_div = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    penalty_div = NMFVAE.laplacian_penalty(W_div, L)
+
+    assert penalty_div.item() > penalty_const.item() + 1e-6, (
+        "Penalty should be larger for divergent gene weights"
+    )
+    assert penalty_div.item() > 0.0
+
+
+def test_vae_training_with_graph_penalty(dataloader):
+    """Model should train successfully when graph Laplacian penalty is active."""
+    from model.vae import NMFVAE
+    from utils.graph_utils import build_laplacian_from_adjacency
+
+    # Build a trivial chain-graph Laplacian over N_GENES genes
+    A = np.zeros((N_GENES, N_GENES), dtype=np.float32)
+    for i in range(N_GENES - 1):
+        A[i, i + 1] = 1.0
+        A[i + 1, i] = 1.0
+    L = build_laplacian_from_adjacency(A, normalized=False)
+    L_tensor = torch.tensor(L, dtype=torch.float32)
+
+    model = NMFVAE(
+        N_GENES,
+        LATENT_DIM,
+        hidden_dims=[64, 32],
+        lambda_graph="weak",
+        graph_laplacian=L_tensor,
+    )
+    loss_history = model.fit(dataloader, epochs=5, lr=1e-3, kl_weight=0.1, kl_warmup_epochs=2)
+
+    assert len(loss_history) == 5
+    assert all(np.isfinite(l) for l in loss_history), f"Non-finite losses: {loss_history}"
+
+
+def test_vae_lambda_preset_none_disables_penalty():
+    """lambda_graph='none' should disable the penalty (same as 0.0)."""
+    from model.vae import NMFVAE
+
+    model = NMFVAE(N_GENES, LATENT_DIM, hidden_dims=[64, 32], lambda_graph="none")
+    assert model.lambda_graph == 0.0
+
+
+def test_set_graph_laplacian():
+    """set_graph_laplacian should update the buffer."""
+    from model.vae import NMFVAE
+
+    model = NMFVAE(N_GENES, LATENT_DIM, hidden_dims=[64, 32], lambda_graph=0.1)
+    assert model._graph_laplacian is None
+
+    L = torch.eye(N_GENES)
+    model.set_graph_laplacian(L)
+    assert model._graph_laplacian is not None
+    assert model._graph_laplacian.shape == (N_GENES, N_GENES)
+
+
+def test_build_coexpression_laplacian(synthetic_counts):
+    """build_coexpression_laplacian should return a valid PSD Laplacian."""
+    from utils.graph_utils import build_coexpression_laplacian
+
+    L = build_coexpression_laplacian(synthetic_counts, k=5, normalized=True)
+
+    assert isinstance(L, torch.Tensor)
+    assert L.shape == (N_GENES, N_GENES)
+    assert torch.isfinite(L).all()
+
+    # Symmetry
+    torch.testing.assert_close(L, L.t(), atol=1e-5, rtol=0)
+
+    # PSD: all eigenvalues >= 0
+    eigvals = torch.linalg.eigvalsh(L)
+    assert (eigvals >= -1e-4).all(), f"Non-PSD eigenvalues: {eigvals.min().item()}"
+
+
+def test_build_hybrid_laplacian():
+    """build_hybrid_laplacian should interpolate correctly."""
+    from utils.graph_utils import build_hybrid_laplacian
+
+    L1 = torch.eye(4)
+    L2 = torch.zeros(4, 4)
+
+    # alpha=1.0 → all L1
+    L_hybrid = build_hybrid_laplacian(L1, L2, alpha=1.0)
+    torch.testing.assert_close(L_hybrid, L1)
+
+    # alpha=0.0 → all L2
+    L_hybrid = build_hybrid_laplacian(L1, L2, alpha=0.0)
+    torch.testing.assert_close(L_hybrid, L2)
+
+    # alpha=0.5 → average
+    L_hybrid = build_hybrid_laplacian(L1, L2, alpha=0.5)
+    torch.testing.assert_close(L_hybrid, 0.5 * L1)
+
+
+def test_fit_model_api_with_graph_penalty(synthetic_counts):
+    """fit_model should accept lambda_graph and graph_laplacian in config."""
+    from model.vae import fit_model
+    from utils.graph_utils import build_laplacian_from_adjacency
+
+    A = np.eye(N_GENES, dtype=np.float32)  # trivial identity-graph Laplacian → zero
+    L = build_laplacian_from_adjacency(A, normalized=False)
+    L_tensor = torch.tensor(L, dtype=torch.float32)
+
+    config = {
+        "latent_dim": LATENT_DIM,
+        "hidden_dims": [64, 32],
+        "epochs": 2,
+        "batch_size": 16,
+        "lr": 1e-3,
+        "kl_weight": 0.1,
+        "lambda_graph": "moderate",
+        "graph_laplacian": L_tensor,
+    }
+    model = fit_model(synthetic_counts, config=config)
+    assert model is not None
+    assert model.lambda_graph == pytest.approx(0.1)
+    assert len(model.loss_history) == 2
+

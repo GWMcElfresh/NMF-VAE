@@ -11,6 +11,7 @@ NMF-VAE learns latent **gene programs** from single-cell RNA-seq count data:
 - **Interpretable decoder** – non-negative weight matrix W links factors to genes
 - **Negative Binomial / Poisson likelihood** – models overdispersed count data
 - **Weibull approximate posterior** – provides a reparameterizable Gamma approximation
+- **Graph Laplacian regularization** – optional STRING or co-expression network prior on decoder weights
 
 The model most closely resembles a VAE generalization of **scHPF / Poisson NMF**.
 
@@ -25,10 +26,13 @@ NMF-VAE/
 │   └── vae.py             # NMFVAE model + scikit-learn-style API
 ├── utils/
 │   ├── data_utils.py      # Data loading (h5ad, mtx, csv), DataLoader utils
+│   ├── graph_utils.py     # Graph Laplacian utilities (STRING, co-expression, hybrid)
 │   └── plot_utils.py      # Latent space plots, ELBO curves, gene loadings
 ├── scripts/
 │   ├── train.py           # CLI training script
 │   └── preprocess.py      # CLI preprocessing / QC script
+├── notebooks/
+│   └── graph_laplacian_tutorial.ipynb  # Interactive tutorial for graph regularization
 ├── tests/
 │   └── test_model.py      # pytest unit tests
 ├── data/                  # Place input data here (gitignored by default)
@@ -121,13 +125,38 @@ python scripts/preprocess.py \
     --output data/processed.npz \
     --min-genes 200 --min-cells 10 --normalize --log1p
 
-# Train
+# Train (no graph prior)
 python scripts/train.py \
     --input data/processed.h5ad \
     --output results/ \
     --latent-dim 20 \
     --epochs 200 \
     --batch-size 256
+
+# Train with STRING graph Laplacian regularization
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --latent-dim 20 \
+    --epochs 200 \
+    --lambda-graph moderate \
+    --use-string-graph \
+    --genes-file data/gene_names.txt \
+    --confidence-threshold 0.7 \
+    --use-normalized-laplacian
+
+# Train with hybrid graph (STRING + co-expression)
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --latent-dim 20 \
+    --epochs 200 \
+    --lambda-graph 0.05 \
+    --use-string-graph \
+    --genes-file data/gene_names.txt \
+    --use-coexpression-graph \
+    --use-hybrid-graph \
+    --alpha-graph-mix 0.7
 ```
 
 ## Model Details
@@ -153,19 +182,107 @@ q(z_i | x_i) = Weibull(k_i, lambda_i)   # Approximate posterior
 L = E_q[log p(x|z)] - KL[q(z|x) || p(z)]
 ```
 
+---
+
+## Graph Laplacian Regularization
+
+NMF-VAE supports an optional **graph Laplacian penalty** on the decoder weight matrix:
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{ELBO}} + \lambda \cdot \mathrm{Tr}(W^\top L W)$$
+
+where $W \in \mathbb{R}_+^{G \times K}$ is the decoder weight matrix and $L$ is a graph Laplacian derived from a gene interaction network (e.g. STRING).
+
+The penalty encourages **connected genes** (large $A_{ij}$) to have **similar decoder weight rows**, producing gene programs that align with known biological pathways.
+
+### λ presets
+
+| Preset | λ value | Behavior |
+|--------|---------|----------|
+| `"none"` | 0.0 | Pure data-driven (disabled) |
+| `"weak"` | 0.01 | Soft STRING nudge |
+| `"moderate"` | 0.10 | Aligned with STRING pathways |
+| `"strong"` | 1.00 | Strongly constrained by STRING |
+
+You may also pass any non-negative float directly (e.g. `lambda_graph=0.05`).
+
+### Python API
+
+```python
+from utils.graph_utils import build_string_laplacian
+from model.vae import fit_model
+
+# Build STRING Laplacian (requires internet + requests)
+L = build_string_laplacian(
+    genes                = gene_names,   # list of gene symbols matching count matrix columns
+    confidence_threshold = 0.7,
+    species_id           = 9606,         # 9606 = human, 10090 = mouse
+    normalized           = True,
+)
+
+# Train with graph prior
+model = fit_model(X, config={
+    "latent_dim"      : 20,
+    "epochs"          : 200,
+    "lambda_graph"    : "moderate",    # or e.g. lambda_graph=0.05
+    "graph_laplacian" : L,
+})
+```
+
+### Data-driven (co-expression) prior
+
+```python
+from utils.graph_utils import build_coexpression_laplacian
+
+L = build_coexpression_laplacian(X, k=15, normalized=True)
+model = fit_model(X, config={"lambda_graph": "weak", "graph_laplacian": L, ...})
+```
+
+### Hybrid graph (STRING + co-expression)
+
+```python
+from utils.graph_utils import build_string_laplacian, build_coexpression_laplacian, build_hybrid_laplacian
+
+L_string = build_string_laplacian(gene_names)
+L_data   = build_coexpression_laplacian(X, k=15)
+L_hybrid = build_hybrid_laplacian(L_string, L_data, alpha=0.7)  # 70% STRING, 30% data
+
+model = fit_model(X, config={"lambda_graph": "moderate", "graph_laplacian": L_hybrid, ...})
+```
+
+### Updating the Laplacian at runtime
+
+```python
+model.set_graph_laplacian(L_new)   # swap prior without rebuilding model
+```
+
+### Interactive tutorial
+
+See **`notebooks/graph_laplacian_tutorial.ipynb`** for an end-to-end walkthrough covering:
+- Synthetic dataset construction and baseline training
+- Mathematical intuition behind the Laplacian penalty
+- λ sweep: `none → weak → moderate → strong`
+- Building and visualising the STRING adjacency
+- Co-expression kNN graph
+- Hybrid graph α sweep (STRING vs data)
+- Real scRNA-seq workflow reference
+
 ## Tests
 
 ```bash
 pytest tests/ -v
 ```
 
-All 9 unit tests cover:
+Unit tests cover:
 - WeibullDistribution (rsample, log_prob)
 - Encoder / Decoder forward passes
 - Full model forward + ELBO
 - End-to-end training (5 epochs on synthetic data)
 - Data utilities
 - High-level API (fit_model, transform, get_gene_programs)
+- Graph utilities: `resolve_lambda` (presets + float + invalid), Laplacian math (unnormalized, normalized, isolated nodes)
+- Laplacian penalty properties (zero for constant genes, positive for divergent)
+- Training with graph Laplacian penalty enabled
+- `set_graph_laplacian`, co-expression Laplacian, hybrid Laplacian, API with graph config
 
 ## CI/CD
 

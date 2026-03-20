@@ -14,6 +14,13 @@ import numpy as np
 
 from model.vae import NMFVAE
 from utils.data_utils import load_data, create_dataloader, write_outputs
+from utils.graph_utils import (
+    LAMBDA_PRESETS,
+    build_string_laplacian,
+    build_coexpression_laplacian,
+    build_hybrid_laplacian,
+    resolve_lambda,
+)
 from utils.plot_utils import plot_elbo
 
 
@@ -38,6 +45,78 @@ def parse_args():
         action="store_true",
         help="Use Poisson likelihood instead of NB",
     )
+
+    # Graph Laplacian arguments
+    graph_group = parser.add_argument_group("Graph Laplacian regularization")
+    graph_group.add_argument(
+        "--lambda-graph",
+        default="none",
+        help=(
+            "Strength of graph Laplacian penalty.  Accepts a non-negative "
+            "float or one of the named presets: "
+            + ", ".join(f"'{k}' ({v})" for k, v in LAMBDA_PRESETS.items())
+            + ".  Default: 'none' (disabled)."
+        ),
+    )
+    graph_group.add_argument(
+        "--genes-file",
+        default=None,
+        help=(
+            "Path to a plain-text file with one gene symbol per line, "
+            "matching the columns of the count matrix.  Required when using "
+            "STRING-based graph regularization (--use-string-graph)."
+        ),
+    )
+    graph_group.add_argument(
+        "--use-string-graph",
+        action="store_true",
+        help="Build graph Laplacian from the STRING protein interaction network.",
+    )
+    graph_group.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.7,
+        help="STRING edge confidence threshold in [0, 1] (default: 0.7).",
+    )
+    graph_group.add_argument(
+        "--species-id",
+        type=int,
+        default=9606,
+        help="NCBI taxonomy species ID for STRING queries (default: 9606 = human).",
+    )
+    graph_group.add_argument(
+        "--use-normalized-laplacian",
+        action="store_true",
+        help="Use the symmetric normalized Laplacian (default: unnormalized).",
+    )
+    graph_group.add_argument(
+        "--use-coexpression-graph",
+        action="store_true",
+        help="Build a gene co-expression kNN graph Laplacian from the data.",
+    )
+    graph_group.add_argument(
+        "--k-data-graph",
+        type=int,
+        default=10,
+        help="Number of nearest neighbors for the co-expression kNN graph (default: 10).",
+    )
+    graph_group.add_argument(
+        "--use-hybrid-graph",
+        action="store_true",
+        help=(
+            "Combine STRING and co-expression Laplacians "
+            "(requires --use-string-graph and --use-coexpression-graph)."
+        ),
+    )
+    graph_group.add_argument(
+        "--alpha-graph-mix",
+        type=float,
+        default=0.5,
+        help=(
+            "Mixing coefficient for the hybrid graph: "
+            "alpha * L_STRING + (1 - alpha) * L_data (default: 0.5)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -50,13 +129,73 @@ def main():
 
     dataloader = create_dataloader(X, batch_size=args.batch_size, shuffle=True)
 
+    # ------------------------------------------------------------------
+    # Resolve graph Laplacian
+    # ------------------------------------------------------------------
+    graph_laplacian = None
+    lambda_val = resolve_lambda(args.lambda_graph)
+
+    if lambda_val > 0.0:
+        normalized = args.use_normalized_laplacian
+
+        L_string = None
+        L_data = None
+
+        if args.use_string_graph:
+            if args.genes_file is None:
+                parser_err = (
+                    "--genes-file is required when using --use-string-graph."
+                )
+                raise SystemExit(f"Error: {parser_err}")
+            with open(args.genes_file) as fh:
+                genes = [line.strip() for line in fh if line.strip()]
+            print(
+                f"Building STRING Laplacian for {len(genes)} genes "
+                f"(confidence ≥ {args.confidence_threshold})…"
+            )
+            L_string = build_string_laplacian(
+                genes,
+                confidence_threshold=args.confidence_threshold,
+                species_id=args.species_id,
+                normalized=normalized,
+            )
+            print("  STRING Laplacian built.")
+
+        if args.use_coexpression_graph:
+            print(f"Building co-expression Laplacian (k={args.k_data_graph})…")
+            L_data = build_coexpression_laplacian(
+                X, k=args.k_data_graph, normalized=normalized
+            )
+            print("  Co-expression Laplacian built.")
+
+        if args.use_hybrid_graph:
+            if L_string is None or L_data is None:
+                raise SystemExit(
+                    "Error: --use-hybrid-graph requires both "
+                    "--use-string-graph and --use-coexpression-graph."
+                )
+            graph_laplacian = build_hybrid_laplacian(
+                L_string, L_data, alpha=args.alpha_graph_mix
+            )
+            print(
+                f"  Using hybrid Laplacian (alpha={args.alpha_graph_mix})."
+            )
+        elif L_string is not None:
+            graph_laplacian = L_string
+        elif L_data is not None:
+            graph_laplacian = L_data
+
     model = NMFVAE(
         input_dim=X.shape[1],
         latent_dim=args.latent_dim,
         hidden_dims=args.hidden_dims,
         use_nb=not args.use_poisson,
+        lambda_graph=args.lambda_graph,
+        graph_laplacian=graph_laplacian,
     )
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
+    if lambda_val > 0.0:
+        print(f"Graph Laplacian penalty: lambda={lambda_val}")
 
     print("Training...")
     loss_history = model.fit(
