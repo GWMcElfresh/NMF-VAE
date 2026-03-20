@@ -16,10 +16,12 @@ from model.vae import NMFVAE
 from utils.data_utils import load_data, create_dataloader, write_outputs
 from utils.graph_utils import (
     LAMBDA_PRESETS,
+    ARCHS4_CORRELATION_URL,
     build_string_laplacian,
     build_coexpression_laplacian,
     build_hybrid_laplacian,
     build_correlation_laplacian,
+    fetch_archs4_correlation,
     save_laplacian,
     resolve_lambda,
 )
@@ -165,6 +167,26 @@ def parse_args():
             "Writes <prefix>_laplacian.npy and <prefix>_W.csv."
         ),
     )
+    graph_group.add_argument(
+        "--fetch-archs4",
+        action="store_true",
+        help=(
+            "Download the ARCHS4 human gene-gene correlation matrix (~6 GB) "
+            f"from {ARCHS4_CORRELATION_URL} and use it as the correlation pkl. "
+            "The file is cached at ~/.cache/nmfvae/human_correlation_v2.4.pkl "
+            "so subsequent runs are instant.  Requires --genes-file and "
+            "--lambda-graph > 0."
+        ),
+    )
+    graph_group.add_argument(
+        "--archs4-cache-path",
+        default=None,
+        help=(
+            "Local path to cache the downloaded ARCHS4 pkl file "
+            "(default: ~/.cache/nmfvae/human_correlation_v2.4.pkl). "
+            "Only used together with --fetch-archs4."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -233,7 +255,18 @@ def main():
         elif L_data is not None:
             graph_laplacian = L_data
 
-        if args.correlation_pkl is not None:
+        # --fetch-archs4 downloads/caches the pkl and sets correlation_pkl
+        correlation_pkl = args.correlation_pkl
+        if args.fetch_archs4:
+            if args.genes_file is None:
+                raise SystemExit(
+                    "Error: --genes-file is required when using --fetch-archs4."
+                )
+            correlation_pkl = fetch_archs4_correlation(
+                dest_path=args.archs4_cache_path
+            )
+
+        if correlation_pkl is not None:
             if args.genes_file is None:
                 raise SystemExit(
                     "Error: --genes-file is required when using "
@@ -243,12 +276,12 @@ def main():
                 genes = [line.strip() for line in fh if line.strip()]
             print(
                 f"Building correlation Laplacian for {len(genes)} genes "
-                f"from {args.correlation_pkl} "
+                f"from {correlation_pkl} "
                 f"(threshold={args.correlation_threshold})…"
             )
             corr_laplacian, matched = build_correlation_laplacian(
                 genes,
-                pkl_path=args.correlation_pkl,
+                pkl_path=correlation_pkl,
                 correlation_threshold=args.correlation_threshold,
                 normalized=normalized,
                 weak_prior_diagonal=args.weak_prior_diagonal,

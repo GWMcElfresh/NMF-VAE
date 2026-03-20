@@ -278,6 +278,21 @@ where $D_{|A|} = \mathrm{diag}(|A|\mathbf{1})$ is the absolute-value degree matr
 - **Penalises dissimilar** decoder weight rows for *positively* correlated gene pairs.
 - **Penalises similar** decoder weight rows for *negatively* correlated gene pairs.
 
+### Downloading the ARCHS4 correlation matrix
+
+```python
+from utils.graph_utils import fetch_archs4_correlation
+
+# Download once (~6 GB); subsequent calls return the cached path instantly
+pkl_path = fetch_archs4_correlation(
+    dest_path="~/.cache/nmfvae/human_correlation_v2.4.pkl"  # optional; default location
+)
+```
+
+The file is fetched from `https://s3.amazonaws.com/mssm-data/human_correlation_v2.4.pkl` and
+cached locally at `~/.cache/nmfvae/human_correlation_v2.4.pkl` by default.  Pass
+`force=True` to force a re-download.
+
 ### Python API
 
 ```python
@@ -327,7 +342,18 @@ Unmatched genes receive a small diagonal value (`weak_prior_diagonal`) in the La
 ### CLI
 
 ```bash
-# Train with correlation-based signed Laplacian prior
+# Auto-download ARCHS4 correlation matrix and train in one step
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --genes-file data/gene_names.txt \
+    --lambda-graph moderate \
+    --fetch-archs4 \
+    --correlation-threshold 0.5 \
+    --weak-prior-diagonal 0.1 \
+    --save-laplacian results/my_laplacian
+
+# Train with a manually-downloaded correlation pkl
 python scripts/train.py \
     --input data/processed.h5ad \
     --output results/ \
@@ -344,7 +370,7 @@ python scripts/train.py \
     --output results/ \
     --genes-file data/gene_names.txt \
     --lambda-graph moderate \
-    --correlation-pkl human_correlation_v2.4.pkl \
+    --fetch-archs4 \
     --use-string-graph \
     --use-hybrid-graph \
     --alpha-graph-mix 0.7 \
@@ -377,6 +403,7 @@ Unit tests cover:
 - **Signed Laplacian** (unnormalized, normalized, isolated nodes)
 - **Correlation Laplacian** (`build_correlation_laplacian`: matched genes, unmatched genes with weak prior, thresholding, missing file)
 - **`save_laplacian`** (with and without W matrix)
+- **`fetch_archs4_correlation`** (cache hit, streaming download, force re-download, missing requests package)
 - **End-to-end training** with a signed graph Laplacian
 
 ## CI/CD

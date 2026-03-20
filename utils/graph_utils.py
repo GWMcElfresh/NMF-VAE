@@ -7,6 +7,7 @@ Provides tools for:
 - Building signed graph Laplacians from pre-computed gene-gene correlation matrices
 - Computing hybrid Laplacians mixing STRING and co-expression graphs
 - Converting gene names to official NCBI symbols via mygene
+- Fetching the ARCHS4 human gene-gene correlation matrix from S3
 - Resolving the lambda (regularization strength) parameter from named presets
 - Saving computed Laplacians and decoder weight matrices to disk
 """
@@ -558,9 +559,9 @@ def build_correlation_laplacian(
     common_genes = [g for g in query_genes if g in corr_index_set]
 
     if common_genes:
-        # Vectorised extraction of the relevant submatrix
+        # Vectorised extraction of the relevant submatrix (.copy() ensures mutability)
         sub_corr = corr_df.loc[common_genes, common_genes].to_numpy(
-            dtype=np.float32
+            dtype=np.float32, copy=True
         )
         np.fill_diagonal(sub_corr, 0.0)
         # Threshold spurious correlations
@@ -595,6 +596,123 @@ def build_correlation_laplacian(
                 L[i, i] = float(weak_prior_diagonal)
 
     return L, matched
+
+
+# ---------------------------------------------------------------------------
+# ARCHS4 correlation matrix download
+# ---------------------------------------------------------------------------
+
+#: Public S3 URL for the ARCHS4 v2.4 human gene-gene correlation matrix.
+ARCHS4_CORRELATION_URL: str = (
+    "https://s3.amazonaws.com/mssm-data/human_correlation_v2.4.pkl"
+)
+
+
+def fetch_archs4_correlation(
+    dest_path: Optional[str] = None,
+    url: str = ARCHS4_CORRELATION_URL,
+    chunk_size: int = 1024 * 1024,
+    force: bool = False,
+) -> str:
+    """
+    Download the ARCHS4 human gene-gene correlation matrix from S3.
+
+    The file is approximately **6 GB** and is only downloaded once; subsequent
+    calls return the cached path without re-downloading unless *force=True*.
+
+    The correlation matrix is a :class:`pandas.DataFrame` pickled with Python's
+    ``pickle`` protocol, with gene symbols as both the row index and column
+    names.  Pass the returned path directly to
+    :func:`build_correlation_laplacian`.
+
+    Requires internet access and the ``requests`` package
+    (``pip install requests``).
+
+    Args:
+        dest_path: Local filesystem path where the pkl file should be saved.
+            Defaults to ``~/.cache/nmfvae/human_correlation_v2.4.pkl``.
+        url: Download URL.  Defaults to
+            :data:`ARCHS4_CORRELATION_URL`.
+        chunk_size: Number of bytes per streaming chunk during download
+            (default 1 MiB).  Larger values reduce syscall overhead on fast
+            connections.
+        force: If ``True``, re-download even if the file already exists
+            (default ``False``).
+
+    Returns:
+        Absolute path to the downloaded (or already-cached) pkl file.
+
+    Raises:
+        ImportError: If the ``requests`` package is not installed.
+        RuntimeError: If the HTTP request fails or returns a non-200 status.
+    """
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "The 'requests' package is required to download the ARCHS4 "
+            "correlation matrix.  Install it with: pip install requests"
+        ) from exc
+
+    if dest_path is None:
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "nmfvae"
+        )
+        dest_path = os.path.join(cache_dir, "human_correlation_v2.4.pkl")
+
+    dest_path = os.path.abspath(dest_path)
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    if os.path.exists(dest_path) and not force:
+        print(f"Using cached ARCHS4 correlation matrix: {dest_path}")
+        return dest_path
+
+    print(f"Downloading ARCHS4 correlation matrix from {url}")
+    print(f"  Destination: {dest_path}")
+    print("  File size: ~6 GB — this may take several minutes.")
+
+    try:
+        response = requests.get(url, stream=True, timeout=300)
+        response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download ARCHS4 correlation matrix: {exc}"
+        ) from exc
+
+    total = int(response.headers.get("content-length", 0))
+    downloaded = 0
+    report_every = 100 * 1024 * 1024  # report every 100 MiB
+    next_report = report_every
+
+    # Write to a temporary file first, then rename on success to avoid
+    # leaving a partial file behind if the download is interrupted.
+    tmp_path = dest_path + ".part"
+    try:
+        with open(tmp_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_report:
+                        if total:
+                            pct = 100.0 * downloaded / total
+                            print(
+                                f"  {downloaded / 1e9:.2f} GB / "
+                                f"{total / 1e9:.2f} GB ({pct:.0f}%)"
+                            )
+                        else:
+                            print(f"  {downloaded / 1e9:.2f} GB downloaded")
+                        next_report += report_every
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    print(
+        f"  Download complete: {downloaded / 1e9:.2f} GB saved to {dest_path}"
+    )
+    return dest_path
 
 
 # ---------------------------------------------------------------------------

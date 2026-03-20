@@ -691,3 +691,110 @@ def test_vae_training_with_signed_laplacian(dataloader):
     assert len(loss_history) == 3
     assert all(np.isfinite(lo) for lo in loss_history), f"Non-finite losses: {loss_history}"
 
+
+# --------------------------------------------------------------------------
+# fetch_archs4_correlation tests
+# --------------------------------------------------------------------------
+
+
+def test_fetch_archs4_correlation_uses_cache(tmp_path):
+    """fetch_archs4_correlation should reuse an existing file without downloading."""
+    from utils.graph_utils import fetch_archs4_correlation
+
+    # Pre-create a fake cached file
+    cached = str(tmp_path / "human_correlation_v2.4.pkl")
+    with open(cached, "wb") as fh:
+        fh.write(b"fake")
+
+    # Should return immediately without any network call
+    result = fetch_archs4_correlation(dest_path=cached)
+    assert result == cached
+    # File should still contain only the fake data (not overwritten)
+    with open(cached, "rb") as fh:
+        assert fh.read() == b"fake"
+
+
+def test_fetch_archs4_correlation_downloads(tmp_path, monkeypatch):
+    """fetch_archs4_correlation should stream-download and rename atomically."""
+    import pickle
+    import pandas as pd
+    from utils.graph_utils import fetch_archs4_correlation
+
+    # Build a small fake pickle payload (stand-in for the real ~6 GB file)
+    fake_df = pd.DataFrame({"A": [1.0], "B": [0.5]}, index=["A", "B"])
+    fake_payload = pickle.dumps(fake_df)
+
+    dest = str(tmp_path / "corr.pkl")
+
+    # Patch requests.get to return a fake streaming response
+    import requests
+
+    class FakeResponse:
+        headers = {"content-length": str(len(fake_payload))}
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=None):
+            yield fake_payload
+
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResponse())
+
+    result = fetch_archs4_correlation(dest_path=dest)
+    assert result == dest
+    assert os.path.exists(dest)
+    # Verify the written bytes match what was "downloaded"
+    with open(dest, "rb") as fh:
+        assert fh.read() == fake_payload
+
+
+def test_fetch_archs4_correlation_force_redownload(tmp_path, monkeypatch):
+    """force=True should overwrite an existing cached file."""
+    import pickle
+    import pandas as pd
+    from utils.graph_utils import fetch_archs4_correlation
+
+    dest = str(tmp_path / "corr.pkl")
+    # Write stale content
+    with open(dest, "wb") as fh:
+        fh.write(b"old")
+
+    new_payload = pickle.dumps(pd.DataFrame())
+    import requests
+
+    class FakeResponse:
+        headers = {}
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=None):
+            yield new_payload
+
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResponse())
+
+    fetch_archs4_correlation(dest_path=dest, force=True)
+    with open(dest, "rb") as fh:
+        assert fh.read() == new_payload
+
+
+def test_fetch_archs4_correlation_missing_requests(tmp_path, monkeypatch):
+    """ImportError should be raised when 'requests' is not installed."""
+    import builtins
+    from utils.graph_utils import fetch_archs4_correlation
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "requests":
+            raise ImportError("No module named 'requests'")
+        return real_import(name, *args, **kwargs)
+
+    dest = str(tmp_path / "corr.pkl")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(ImportError, match="requests"):
+        fetch_archs4_correlation(dest_path=dest)
+
