@@ -5,6 +5,7 @@ All tests use small synthetic data (50 cells, 100 genes).
 """
 
 import numpy as np
+import os
 import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -472,4 +473,221 @@ def test_fit_model_api_with_graph_penalty(synthetic_counts):
     assert model is not None
     assert model.lambda_graph == pytest.approx(0.1)
     assert len(model.loss_history) == 2
+
+
+# --------------------------------------------------------------------------
+# Signed Laplacian tests
+# --------------------------------------------------------------------------
+
+
+def test_build_signed_laplacian_unnormalized():
+    """Unnormalized signed Laplacian: L = D_{|A|} - A."""
+    from utils.graph_utils import build_signed_laplacian_from_adjacency
+
+    # One positive and one negative edge
+    A = np.array([[0.0, 1.0, -0.5], [1.0, 0.0, 0.0], [-0.5, 0.0, 0.0]], dtype=np.float32)
+    L = build_signed_laplacian_from_adjacency(A, normalized=False)
+
+    # Diagonal should be sum of |A| row
+    assert L[0, 0] == pytest.approx(1.5, abs=1e-6)
+    assert L[1, 1] == pytest.approx(1.0, abs=1e-6)
+    assert L[2, 2] == pytest.approx(0.5, abs=1e-6)
+
+    # Off-diagonal: L = D - A, so L[0,1] = 0 - A[0,1] = -1.0
+    assert L[0, 1] == pytest.approx(-1.0, abs=1e-6)
+    assert L[0, 2] == pytest.approx(0.5, abs=1e-6)  # -(-0.5) = 0.5
+
+
+def test_build_signed_laplacian_normalized():
+    """Normalized signed Laplacian should be symmetric and finite."""
+    from utils.graph_utils import build_signed_laplacian_from_adjacency
+
+    A = np.array([[0.0, 0.8, -0.3], [0.8, 0.0, 0.4], [-0.3, 0.4, 0.0]], dtype=np.float32)
+    L = build_signed_laplacian_from_adjacency(A, normalized=True)
+
+    assert L.shape == (3, 3)
+    assert np.isfinite(L).all()
+    np.testing.assert_allclose(L, L.T, atol=1e-6)
+
+
+def test_build_signed_laplacian_isolated_nodes():
+    """Isolated nodes (zero absolute degree) are handled without NaNs."""
+    from utils.graph_utils import build_signed_laplacian_from_adjacency
+
+    A = np.array(
+        [[0.0, 0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32
+    )
+    L = build_signed_laplacian_from_adjacency(A, normalized=True)
+    assert np.isfinite(L).all()
+
+
+# --------------------------------------------------------------------------
+# Correlation Laplacian tests (using a small synthetic pkl)
+# --------------------------------------------------------------------------
+
+
+def _make_correlation_pkl(path, genes):
+    """Write a tiny synthetic correlation DataFrame as a pickle."""
+    import pandas as pd
+    import pickle
+
+    n = len(genes)
+    rng = np.random.default_rng(0)
+    corr = rng.uniform(-1, 1, size=(n, n)).astype(np.float32)
+    # Make symmetric and zero diagonal
+    corr = (corr + corr.T) / 2.0
+    np.fill_diagonal(corr, 0.0)
+    df = pd.DataFrame(corr, index=genes, columns=genes)
+    with open(path, "wb") as fh:
+        pickle.dump(df, fh)
+    return df
+
+
+def test_build_correlation_laplacian_basic(tmp_path):
+    """build_correlation_laplacian should return a valid tensor for matched genes."""
+    from utils.graph_utils import build_correlation_laplacian
+
+    genes = [f"GENE{i}" for i in range(10)]
+    pkl_path = str(tmp_path / "corr.pkl")
+    _make_correlation_pkl(pkl_path, genes)
+
+    L, matched = build_correlation_laplacian(
+        genes,
+        pkl_path=pkl_path,
+        correlation_threshold=0.3,
+        normalized=True,
+        convert_ncbi=False,  # skip network call in tests
+    )
+
+    assert isinstance(L, torch.Tensor)
+    assert L.shape == (10, 10)
+    assert torch.isfinite(L).all()
+    assert len(matched) == 10
+    assert all(matched), "All genes should match the synthetic pkl"
+
+
+def test_build_correlation_laplacian_unmatched_genes(tmp_path):
+    """Unmatched genes should receive the weak_prior_diagonal value."""
+    from utils.graph_utils import build_correlation_laplacian
+
+    pkl_genes = [f"GENE{i}" for i in range(8)]
+    query_genes = pkl_genes + ["LOC123456", "NOVEL99"]  # 2 unmatched
+    pkl_path = str(tmp_path / "corr.pkl")
+    _make_correlation_pkl(pkl_path, pkl_genes)
+
+    weak_val = 0.05
+    L, matched = build_correlation_laplacian(
+        query_genes,
+        pkl_path=pkl_path,
+        correlation_threshold=0.3,
+        normalized=True,
+        weak_prior_diagonal=weak_val,
+        convert_ncbi=False,
+    )
+
+    assert L.shape == (10, 10)
+    assert matched.count(False) == 2
+    # Unmatched gene indices 8 and 9 should have L[i,i] == weak_val
+    assert L[8, 8].item() == pytest.approx(weak_val, abs=1e-6)
+    assert L[9, 9].item() == pytest.approx(weak_val, abs=1e-6)
+
+
+def test_build_correlation_laplacian_threshold(tmp_path):
+    """High threshold should zero out most edges, leaving a sparser graph."""
+    from utils.graph_utils import build_correlation_laplacian
+    import pandas as pd
+    import pickle
+
+    genes = [f"G{i}" for i in range(6)]
+    # Craft a correlation matrix with known values
+    corr = np.zeros((6, 6), dtype=np.float32)
+    corr[0, 1] = corr[1, 0] = 0.9   # strong positive
+    corr[2, 3] = corr[3, 2] = -0.8  # strong negative
+    corr[4, 5] = corr[5, 4] = 0.2   # below threshold
+    df = pd.DataFrame(corr, index=genes, columns=genes)
+    pkl_path = str(tmp_path / "corr_thresh.pkl")
+    with open(pkl_path, "wb") as fh:
+        pickle.dump(df, fh)
+
+    L_high, _ = build_correlation_laplacian(
+        genes, pkl_path=pkl_path, correlation_threshold=0.5,
+        normalized=False, convert_ncbi=False,
+    )
+    # Edge (4,5) is below 0.5 → should be zero in L
+    assert L_high[4, 5].item() == pytest.approx(0.0, abs=1e-6)
+    # Edge (0,1) is 0.9 → should be non-zero
+    assert L_high[0, 1].item() != pytest.approx(0.0, abs=1e-6)
+
+
+def test_build_correlation_laplacian_file_not_found():
+    """FileNotFoundError should be raised for a missing pkl path."""
+    from utils.graph_utils import build_correlation_laplacian
+
+    with pytest.raises(FileNotFoundError):
+        build_correlation_laplacian(
+            ["GENE1"], pkl_path="/nonexistent/path.pkl", convert_ncbi=False
+        )
+
+
+# --------------------------------------------------------------------------
+# save_laplacian tests
+# --------------------------------------------------------------------------
+
+
+def test_save_laplacian(tmp_path):
+    """save_laplacian should write npy and optionally csv."""
+    from utils.graph_utils import save_laplacian
+
+    L = torch.eye(5)
+    W = np.random.rand(5, 3).astype(np.float32)
+    prefix = str(tmp_path / "test_output")
+
+    save_laplacian(L, prefix, W=W, gene_names=["A", "B", "C", "D", "E"])
+
+    assert os.path.exists(f"{prefix}_laplacian.npy")
+    assert os.path.exists(f"{prefix}_W.csv")
+
+    L_loaded = np.load(f"{prefix}_laplacian.npy")
+    np.testing.assert_allclose(L_loaded, np.eye(5), atol=1e-6)
+
+
+def test_save_laplacian_no_w(tmp_path):
+    """save_laplacian without W should only write the npy file."""
+    from utils.graph_utils import save_laplacian
+
+    L = torch.eye(4)
+    prefix = str(tmp_path / "lap_only")
+    save_laplacian(L, prefix)
+
+    assert os.path.exists(f"{prefix}_laplacian.npy")
+    assert not os.path.exists(f"{prefix}_W.csv")
+
+
+# --------------------------------------------------------------------------
+# VAE training with signed Laplacian (end-to-end)
+# --------------------------------------------------------------------------
+
+
+def test_vae_training_with_signed_laplacian(dataloader):
+    """Model should train when a signed graph Laplacian (with negative edges) is active."""
+    from model.vae import NMFVAE
+    from utils.graph_utils import build_signed_laplacian_from_adjacency
+
+    # Build a signed adjacency with alternating positive/negative edges
+    A = np.zeros((N_GENES, N_GENES), dtype=np.float32)
+    for i in range(N_GENES - 1):
+        sign = 1.0 if i % 2 == 0 else -1.0
+        A[i, i + 1] = sign * 0.5
+        A[i + 1, i] = sign * 0.5
+    L = build_signed_laplacian_from_adjacency(A, normalized=True)
+    L_tensor = torch.tensor(L, dtype=torch.float32)
+
+    model = NMFVAE(
+        N_GENES, LATENT_DIM, hidden_dims=[64, 32],
+        lambda_graph="weak", graph_laplacian=L_tensor,
+    )
+    loss_history = model.fit(dataloader, epochs=3, lr=1e-3, kl_weight=0.1)
+
+    assert len(loss_history) == 3
+    assert all(np.isfinite(lo) for lo in loss_history), f"Non-finite losses: {loss_history}"
 
