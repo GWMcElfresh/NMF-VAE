@@ -16,9 +16,13 @@ from model.vae import NMFVAE
 from utils.data_utils import load_data, create_dataloader, write_outputs
 from utils.graph_utils import (
     LAMBDA_PRESETS,
+    ARCHS4_CORRELATION_URL,
     build_string_laplacian,
     build_coexpression_laplacian,
     build_hybrid_laplacian,
+    build_correlation_laplacian,
+    fetch_archs4_correlation,
+    save_laplacian,
     resolve_lambda,
 )
 from utils.plot_utils import plot_elbo
@@ -117,6 +121,72 @@ def parse_args():
             "alpha * L_STRING + (1 - alpha) * L_data (default: 0.5)."
         ),
     )
+    graph_group.add_argument(
+        "--correlation-pkl",
+        default=None,
+        help=(
+            "Path to a .pkl file of pre-computed gene-gene correlations "
+            "(e.g. human_correlation_v2.4.pkl).  Builds a signed graph "
+            "Laplacian that handles both positive and negative correlations. "
+            "Requires --genes-file."
+        ),
+    )
+    graph_group.add_argument(
+        "--correlation-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Absolute correlation threshold below which edges are removed "
+            "from the correlation graph (default: 0.5).  Higher values yield "
+            "sparser, less noisy graphs."
+        ),
+    )
+    graph_group.add_argument(
+        "--weak-prior-diagonal",
+        type=float,
+        default=0.1,
+        help=(
+            "Diagonal value for genes not found in the correlation matrix, "
+            "providing a weakly informative regularization prior (default: 0.1). "
+            "Set to 0.0 to treat unmatched genes as isolated nodes."
+        ),
+    )
+    graph_group.add_argument(
+        "--no-ncbi-convert",
+        action="store_true",
+        help=(
+            "Disable automatic conversion of gene names to NCBI symbols "
+            "when building the correlation graph (conversion is on by default)."
+        ),
+    )
+    graph_group.add_argument(
+        "--save-laplacian",
+        default=None,
+        help=(
+            "Path prefix for saving the computed Laplacian and W matrix to disk. "
+            "Writes <prefix>_laplacian.npy and <prefix>_W.csv."
+        ),
+    )
+    graph_group.add_argument(
+        "--fetch-archs4",
+        action="store_true",
+        help=(
+            "Download the ARCHS4 human gene-gene correlation matrix (~6 GB) "
+            f"from {ARCHS4_CORRELATION_URL} and use it as the correlation pkl. "
+            "The file is cached at ~/.cache/nmfvae/human_correlation_v2.4.pkl "
+            "so subsequent runs are instant.  Requires --genes-file and "
+            "--lambda-graph > 0."
+        ),
+    )
+    graph_group.add_argument(
+        "--archs4-cache-path",
+        default=None,
+        help=(
+            "Local path to cache the downloaded ARCHS4 pkl file "
+            "(default: ~/.cache/nmfvae/human_correlation_v2.4.pkl). "
+            "Only used together with --fetch-archs4."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -185,6 +255,56 @@ def main():
         elif L_data is not None:
             graph_laplacian = L_data
 
+        # --fetch-archs4 downloads/caches the pkl and sets correlation_pkl
+        correlation_pkl = args.correlation_pkl
+        if args.fetch_archs4:
+            if args.genes_file is None:
+                raise SystemExit(
+                    "Error: --genes-file is required when using --fetch-archs4."
+                )
+            correlation_pkl = fetch_archs4_correlation(
+                dest_path=args.archs4_cache_path
+            )
+
+        if correlation_pkl is not None:
+            if args.genes_file is None:
+                raise SystemExit(
+                    "Error: --genes-file is required when using "
+                    "--correlation-pkl."
+                )
+            with open(args.genes_file) as fh:
+                genes = [line.strip() for line in fh if line.strip()]
+            print(
+                f"Building correlation Laplacian for {len(genes)} genes "
+                f"from {correlation_pkl} "
+                f"(threshold={args.correlation_threshold})…"
+            )
+            corr_laplacian, matched = build_correlation_laplacian(
+                genes,
+                pkl_path=correlation_pkl,
+                correlation_threshold=args.correlation_threshold,
+                normalized=normalized,
+                weak_prior_diagonal=args.weak_prior_diagonal,
+                convert_ncbi=not args.no_ncbi_convert,
+                species_id=args.species_id,
+            )
+            n_matched = sum(matched)
+            print(
+                f"  Correlation Laplacian built "
+                f"({n_matched}/{len(genes)} genes matched)."
+            )
+            # Correlation graph replaces or combines with any existing prior
+            if graph_laplacian is not None:
+                graph_laplacian = build_hybrid_laplacian(
+                    corr_laplacian, graph_laplacian, alpha=args.alpha_graph_mix
+                )
+                print(
+                    f"  Merged with existing Laplacian "
+                    f"(alpha={args.alpha_graph_mix})."
+                )
+            else:
+                graph_laplacian = corr_laplacian
+
     model = NMFVAE(
         input_dim=X.shape[1],
         latent_dim=args.latent_dim,
@@ -215,6 +335,14 @@ def main():
     write_outputs(args.output, Z, W, None, loss_history)
     plot_elbo(loss_history, save_path=os.path.join(args.output, "loss.png"))
     print(f"Results saved to {args.output}")
+
+    if args.save_laplacian is not None and graph_laplacian is not None:
+        gene_names_for_save = None
+        if args.genes_file is not None:
+            with open(args.genes_file) as fh:
+                gene_names_for_save = [line.strip() for line in fh if line.strip()]
+        save_laplacian(graph_laplacian, args.save_laplacian, W=W, gene_names=gene_names_for_save)
+        print(f"Laplacian saved to {args.save_laplacian}_laplacian.npy")
 
 
 if __name__ == "__main__":

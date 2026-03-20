@@ -264,7 +264,124 @@ See **`notebooks/graph_laplacian_tutorial.ipynb`** for an end-to-end walkthrough
 - Building and visualising the STRING adjacency
 - Co-expression kNN graph
 - Hybrid graph α sweep (STRING vs data)
+- Correlation-based signed Laplacian from a pre-computed pkl file
 - Real scRNA-seq workflow reference
+
+## Gene-Gene Correlation Prior (signed Laplacian)
+
+The `human_correlation_v2.4.pkl` file (or similar pre-computed correlation matrices) contains **both positive and negative** gene-gene correlations.  NMF-VAE supports these through a *signed graph Laplacian*:
+
+$$L_s = D_{|A|} - A$$
+
+where $D_{|A|} = \mathrm{diag}(|A|\mathbf{1})$ is the absolute-value degree matrix.  This formulation:
+
+- **Penalises dissimilar** decoder weight rows for *positively* correlated gene pairs.
+- **Penalises similar** decoder weight rows for *negatively* correlated gene pairs.
+
+### Downloading the ARCHS4 correlation matrix
+
+```python
+from utils.graph_utils import fetch_archs4_correlation
+
+# Download once (~6 GB); subsequent calls return the cached path instantly
+pkl_path = fetch_archs4_correlation(
+    dest_path="~/.cache/nmfvae/human_correlation_v2.4.pkl"  # optional; default location
+)
+```
+
+The file is fetched from `https://s3.amazonaws.com/mssm-data/human_correlation_v2.4.pkl` and
+cached locally at `~/.cache/nmfvae/human_correlation_v2.4.pkl` by default.  Pass
+`force=True` to force a re-download.
+
+### Python API
+
+```python
+from utils.graph_utils import build_correlation_laplacian, save_laplacian
+from model.vae import fit_model, get_gene_programs
+
+# Build signed Laplacian from pre-computed correlations
+L, matched = build_correlation_laplacian(
+    genes                = gene_names,          # list matching count matrix columns
+    pkl_path             = "human_correlation_v2.4.pkl",
+    correlation_threshold= 0.5,                 # discard |corr| < 0.5
+    normalized           = True,
+    weak_prior_diagonal  = 0.1,                 # for unmatched (LOC) genes
+    convert_ncbi         = True,                # auto-convert to NCBI symbols
+    species_id           = 9606,                # 9606 = human
+)
+print(f"{sum(matched)}/{len(gene_names)} genes matched the correlation matrix")
+
+model = fit_model(X, config={
+    "latent_dim"      : 20,
+    "epochs"          : 200,
+    "lambda_graph"    : "moderate",
+    "graph_laplacian" : L,
+})
+
+# Save tuned Laplacian and W matrix to disk
+W = get_gene_programs(model=model)
+save_laplacian(L, "results/corr_prior", W=W, gene_names=gene_names)
+# Writes: results/corr_prior_laplacian.npy
+#         results/corr_prior_W.csv
+```
+
+### Gene name conversion
+
+Gene names in single-cell data may not match the NCBI reference exactly (e.g. aliased symbols, species-specific `LOC*` identifiers).  `convert_to_ncbi_gene_names` uses the [MyGene.info](https://mygene.info) REST API to map names to official NCBI symbols:
+
+```python
+from utils.graph_utils import convert_to_ncbi_gene_names
+
+ncbi_names, matched = convert_to_ncbi_gene_names(gene_names, species_id=9606)
+unmatched = [g for g, m in zip(gene_names, matched) if not m]
+print(f"Unmatched genes (will use weak prior): {unmatched}")
+```
+
+Unmatched genes receive a small diagonal value (`weak_prior_diagonal`) in the Laplacian so they are weakly regularised but primarily data-driven.
+
+### CLI
+
+```bash
+# Auto-download ARCHS4 correlation matrix and train in one step
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --genes-file data/gene_names.txt \
+    --lambda-graph moderate \
+    --fetch-archs4 \
+    --correlation-threshold 0.5 \
+    --weak-prior-diagonal 0.1 \
+    --save-laplacian results/my_laplacian
+
+# Train with a manually-downloaded correlation pkl
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --genes-file data/gene_names.txt \
+    --lambda-graph moderate \
+    --correlation-pkl human_correlation_v2.4.pkl \
+    --correlation-threshold 0.5 \
+    --weak-prior-diagonal 0.1 \
+    --save-laplacian results/my_laplacian
+
+# Combine with STRING network (70% correlation, 30% STRING)
+python scripts/train.py \
+    --input data/processed.h5ad \
+    --output results/ \
+    --genes-file data/gene_names.txt \
+    --lambda-graph moderate \
+    --fetch-archs4 \
+    --use-string-graph \
+    --use-hybrid-graph \
+    --alpha-graph-mix 0.7 \
+    --save-laplacian results/hybrid_laplacian
+
+# Disable NCBI name conversion (use gene names as-is)
+python scripts/train.py \
+    --correlation-pkl human_correlation_v2.4.pkl \
+    --no-ncbi-convert \
+    ...
+```
 
 ## Tests
 
@@ -283,6 +400,11 @@ Unit tests cover:
 - Laplacian penalty properties (zero for constant genes, positive for divergent)
 - Training with graph Laplacian penalty enabled
 - `set_graph_laplacian`, co-expression Laplacian, hybrid Laplacian, API with graph config
+- **Signed Laplacian** (unnormalized, normalized, isolated nodes)
+- **Correlation Laplacian** (`build_correlation_laplacian`: matched genes, unmatched genes with weak prior, thresholding, missing file)
+- **`save_laplacian`** (with and without W matrix)
+- **`fetch_archs4_correlation`** (cache hit, streaming download, force re-download, missing requests package)
+- **End-to-end training** with a signed graph Laplacian
 
 ## CI/CD
 
