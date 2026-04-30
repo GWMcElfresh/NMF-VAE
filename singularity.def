@@ -15,7 +15,9 @@ From: nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
         --index-url https://download.pytorch.org/whl/cu121
     pip install --no-cache-dir \
         anndata scanpy scipy pandas \
-        matplotlib seaborn umap-learn pytest
+        matplotlib seaborn umap-learn pytest \
+        requests mygene scikit-learn
+    pip install --no-cache-dir -e /app
 
 %runscript
     exec python "$@"

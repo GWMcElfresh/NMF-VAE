@@ -4,8 +4,10 @@ Plotting utilities for NMF-VAE.
 
 from typing import List, Optional, Union
 
+import os
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend
+if "MPLBACKEND" not in os.environ:
+    matplotlib.use("Agg")  # non-interactive backend for headless/HPC environments
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

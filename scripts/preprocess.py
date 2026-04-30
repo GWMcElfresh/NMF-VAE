@@ -51,7 +51,7 @@ def main():
     print(f"After min-cells filter ({args.min_cells}): {X.shape}")
 
     if args.normalize:
-        lib_sizes = X.sum(axis=1, keepdims=True).clip(1)
+        lib_sizes = X.sum(axis=1, keepdims=True).clip(min=1.0)
         X = X / lib_sizes * 1e4
         print("Library-size normalization applied")
 

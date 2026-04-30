@@ -310,7 +310,7 @@ def main():
         latent_dim=args.latent_dim,
         hidden_dims=args.hidden_dims,
         use_nb=not args.use_poisson,
-        lambda_graph=args.lambda_graph,
+        lambda_graph=lambda_val,
         graph_laplacian=graph_laplacian,
     )
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")

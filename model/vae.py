@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
+import warnings
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -192,7 +194,10 @@ class NMFVAE(nn.Module):
             Scalar penalty value (≥ 0).
         """
         if L.is_sparse:
-            LW = torch.sparse.mm(L, W)
+            if L.layout == torch.sparse_coo or L.layout == torch.sparse_csr:
+                LW = torch.sparse.mm(L, W)
+            else:
+                LW = L.to_dense() @ W
         else:
             LW = L @ W
         return torch.trace(W.t() @ LW)
@@ -251,6 +256,13 @@ class NMFVAE(nn.Module):
             W = self.decoder.W  # (genes, latent), non-negative
             lap_penalty = self.laplacian_penalty(W, self._graph_laplacian)
             loss = loss + self.lambda_graph * lap_penalty
+        elif self.lambda_graph > 0.0 and self._graph_laplacian is None:
+            warnings.warn(
+                "lambda_graph > 0 but no graph_laplacian is registered. "
+                "Graph penalty will be skipped.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         return loss, recon_loss, kl_loss
 
