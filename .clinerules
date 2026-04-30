@@ -1,0 +1,125 @@
+# Cline Rules for NMF-VAE
+
+## Project Identity
+This is **NMF-VAE**: a Variational Autoencoder for single-cell RNA-seq data with non-negative, sparse, interpretable latent space. The model approximates Gamma-Poisson (probabilistic NMF) factorization using a Weibull approximate posterior.
+
+## Language & Style
+- **Python 3.8+** with `from __future__ import annotations` for all new modules
+- **Type hints** required on all public functions/methods (use `typing` module: `Optional`, `List`, `Dict`, `Tuple`, `Union`)
+- **Docstrings**: Google-style with `Args:`, `Returns:`, `Raises:` sections
+- **Line length**: 88 characters maximum (Black-compatible)
+- **Imports**: standard library first, then third-party, then local; use `import` (no `from x import *`)
+
+## Architecture Constraints
+
+### No Circular Imports
+- `model/` modules can import from each other and from `utils/`
+- `utils/` modules must NOT import from `model/` (layered architecture)
+- `scripts/` can import from both `model/` and `utils/`
+- `tests/` can import from both `model/` and `utils/`
+
+### Model Singleton Pattern
+- The module-level `_global_model` in `model/vae.py` is intentional for the scikit-learn API
+- New API functions should support both explicit `model=` parameter and global fallback
+- Do NOT add additional global state without explicit approval
+
+### Graph Laplacian Buffer
+- Graph Laplacians MUST be registered as PyTorch buffers via `register_buffer("_graph_laplacian", ...)`
+- This ensures device movement and state_dict serialization work correctly
+- Validate shape `(input_dim, input_dim)` before registration
+
+### Reparameterization
+- All stochastic sampling goes through `reparameterize()` method
+- Training: sample from Weibull
+- Eval: return deterministic mean (`λ * Γ(1 + 1/k)`)
+- `@torch.no_grad()` MUST be used on `transform()` for inference
+
+### Parameter Constraints
+- Use `F.softplus(x) + epsilon` for positivity constraints (NOT `ReLU`, NOT `exp`, NOT `clamp`)
+- Epsilon values: `1e-4` for encoder outputs, `1e-8` for decoder mu
+- Raw weights stored as `nn.Parameter`; constraint applied in `forward()`
+
+## Testing Rules
+
+### Test Framework
+- **pytest only** — no unittest.TestCase
+- Test files: `tests/test_*.py`
+- Run with: `pytest tests/ -v`
+
+### Test Data
+- ALL tests use **synthetic data** — no real scRNA-seq files in tests
+- Default fixture: `synthetic_counts` = 50 cells × 100 genes, `np.random.default_rng(42)`
+- Default latent dim: 5
+
+### Test File Patterns
+- `tmp_path` fixture for file I/O tests (pytest built-in)
+- `monkeypatch` for mocking external calls (STRING API, requests, imports)
+- Scope monkeypatches to the module under test: `monkeypatch.setattr("utils.graph_utils.requests.get", ...)` NOT `monkeypatch.setattr(requests, "get", ...)`
+
+### Coverage Requirements
+- Every new module/function must have corresponding tests
+- Edge cases: isolated nodes, all-zero genes, negative correlations, threshold=0, threshold=1
+- NaN/Inf detection: `assert np.isfinite(...).all()` on all outputs
+
+## Container Rules
+
+### Docker
+- Multi-stage: `deps` → `runtime`
+- Base: `nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04`
+- Torch install: `--index-url https://download.pytorch.org/whl/cu121`
+- Build args: `BASE_IMAGE`, `SKIP_BASE_DEPS`, `DEPS_IMAGE` (for CI caching)
+- CMD: `pytest tests/` (tests run in container)
+
+### Singularity
+- Must mirror Dockerfile dependencies exactly
+- Required deps: torch (CUDA), numpy, scipy, pandas, anndata, scanpy, matplotlib, seaborn, umap-learn, pytest, **requests**, **mygene**
+- Include `scikit-learn` (implicit dependency from PCA fallback)
+- `%runscript`: source code must be installed or PYTHONPATH set
+
+## File Format Rules
+
+### Input Handling
+- Use `utils/data_utils.py` functions for loading: `load_data()`, `to_tensor()`, `create_dataloader()`
+- Supported extensions: `.h5ad`, `.mtx`, `.csv`, `.tsv`, `.npz`
+- Always convert to `float32` numpy array
+- Handle sparse → dense conversion for `.h5ad` with sparse X
+
+### Output Handling
+- Use `utils/data_utils.py` `write_outputs()` or `model/vae.py` `export_results()`
+- Output formats: CSV for tables, PNG for plots, NPY for Laplacians
+- Directory creation: `os.makedirs(output_dir, exist_ok=True)` before writing
+
+## Graph Laplacian Rules
+
+### Shape Validation
+- Laplacian must be shape `(n_genes, n_genes)` matching the model's `input_dim`
+- Raise `ValueError` with clear message if shape mismatch
+
+### Lambda Resolution
+- Always resolve via `resolve_lambda()` before use
+- Supports: float values, named presets (`"none"`, `"weak"`, `"moderate"`, `"strong"`)
+- Case-insensitive string matching
+- Negative values raise `ValueError`
+
+### Signed Laplacian
+- Uses absolute-value degree matrix: `D_{|A|} = diag(|A|·1)`
+- `L_s = D_{|A|} - A`
+- NOT guaranteed PSD (unlike standard Laplacian)
+
+### Unmatched Genes
+- Warn via `warnings.warn()` when genes don't match correlation matrix
+- Apply `weak_prior_diagonal` to unmatched gene diagonal entries (NOT zero rows)
+
+## Error Handling Rules
+- `ValueError`: invalid parameters (negative lambda, unknown preset, shape mismatch)
+- `FileNotFoundError`: missing correlation pkl
+- `ImportError` + helpful message: optional deps (requests, mygene, anndata)
+- `RuntimeError`: API failures (STRING, ARCHS4 download)
+- Silent fallback: PCA if UMAP fails, pass if metadata concat fails
+
+## Dependencies
+- **File**: `requirements.txt` is the source of truth
+- `setup.py` `install_requires` must match `requirements.txt` (minus dev deps)
+- New deps: add to BOTH files
+- Optional deps: `requests`, `mygene` — check with try/except ImportError
+- Torch: install separately from PyTorch wheel index, not via requirements.txt
