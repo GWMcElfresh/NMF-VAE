@@ -49,6 +49,11 @@ def parse_args():
         action="store_true",
         help="Use Poisson likelihood instead of NB",
     )
+    parser.add_argument(
+        "--save-checkpoint",
+        action="store_true",
+        help="Save model state_dict to model_checkpoint.pt in output directory",
+    )
 
     # Graph Laplacian arguments
     graph_group = parser.add_argument_group("Graph Laplacian regularization")
@@ -334,6 +339,11 @@ def main():
 
     write_outputs(args.output, Z, W, None, loss_history)
     plot_elbo(loss_history, save_path=os.path.join(args.output, "loss.png"))
+
+    if args.save_checkpoint:
+        torch.save(model.state_dict(), os.path.join(args.output, "model_checkpoint.pt"))
+        print(f"Model checkpoint saved to {args.output}/model_checkpoint.pt")
+
     print(f"Results saved to {args.output}")
 
     if args.save_laplacian is not None and graph_laplacian is not None:
