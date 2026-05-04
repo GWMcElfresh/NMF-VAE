@@ -514,7 +514,18 @@ def build_correlation_laplacian(
 
     import pandas as pd  # noqa: PLC0415
 
-    if not os.path.exists(pkl_path):
+    if os.path.isdir(pkl_path):
+        # pkl_path was mistakenly passed as the cache directory.
+        # Attempt to locate the correlation pickle inside it.
+        cache_dir = pkl_path
+        pkl_path = os.path.join(cache_dir, "human_correlation_v2.4.pkl")
+        if not os.path.isfile(pkl_path):
+            raise FileNotFoundError(
+                f"Correlation pickle directory exists but no .pkl found inside: "
+                f"{cache_dir}"
+            )
+
+    if not os.path.isfile(pkl_path):
         raise FileNotFoundError(f"Correlation pickle not found: {pkl_path}")
 
     with open(pkl_path, "rb") as fh:
@@ -661,9 +672,16 @@ def fetch_archs4_correlation(
         dest_path = os.path.join(cache_dir, "human_correlation_v2.4.pkl")
 
     dest_path = os.path.abspath(dest_path)
+
+    if os.path.isdir(dest_path):
+        # dest_path was passed as a directory (e.g. a cache mount point).
+        # Construct the expected pkl filename inside it.
+        dest_path = os.path.join(dest_path, "human_correlation_v2.4.pkl")
+        print(f"  dest_path is a directory; looking for pkl at: {dest_path}")
+
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-    if os.path.exists(dest_path) and not force:
+    if os.path.isfile(dest_path) and not force:
         print(f"Using cached ARCHS4 correlation matrix: {dest_path}")
         return dest_path
 
